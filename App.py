@@ -798,215 +798,57 @@ if sort_output:
         "Employee Full Name", key=lambda s: s.astype(str).str.upper()
     ).reset_index(drop=True)
 
-# --- Summary -----------------------------------------------------------------
-st.subheader("Summary")
-m1, m2, m3, m4, m5, m6 = st.columns(6)
-m1.metric("Rows in", f"{len(hist_df):,}")
-m2.metric("Matched & updated", f"{merged['matched_count']:,}")
-m3.metric("Rehires linked", f"{len(merged['rehire_log']):,}")
-m4.metric("New hires added", f"{len(merged['new_hires']):,}")
-m5.metric(
-    "Dropped",
-    f"{len(merged['dropped']):,}",
-)
-m6.metric("Rows out", f"{len(out_df):,}")
+# --- Results -----------------------------------------------------------------
 
-hours_added = new_df["Actual Hours"].sum(skipna=True)
-carried = merged["rehire_log"]["Hours carried forward"].sum() if len(merged["rehire_log"]) else 0
-st.caption(
-    f"{hours_added:,.2f} actual hours added this week across "
-    f"{int(new_df['Actual Hours'].notna().sum()):,} employees. "
-    f"Field changes applied: {len(merged['field_log']):,}. "
-    f"Hours preserved through rehire links: {carried:,.2f}."
-)
 
-st.caption(
-    "All attribute fields are synced from each person's newest row, so the "
-    "weekly export no longer updates them on older rows."
-)
+def count_people(log, was, now):
+    """Distinct people whose Employment Status moved from `was` to `now`.
 
-# --- Warnings ----------------------------------------------------------------
-if len(merged["ambiguous"]):
-    st.error(
-        f"{len(merged['ambiguous'])} name(s) could be a rehire but have several "
-        "possible matches, so they were left alone rather than guessed at. "
-        "See the **Needs review** tab - these hours will be lost if you don't "
-        "resolve them by hand."
-    )
+    Draws on both the weekly update and the duplicate sync, then de-duplicates
+    by name: one person with several rows that all flipped is still one person.
+    """
+    names = set()
+    for frame in log:
+        if not len(frame):
+            continue
+        if not {"Field", "Was", "Now"} <= set(frame.columns):
+            continue
+        hit = frame[
+            (frame["Field"] == "Employment Status")
+            & (frame["Was"] == was)
+            & (frame["Now"] == now)
+        ]
+        names |= {normalized_name(v) for v in hit["Employee Full Name"]}
+    names.discard("")
+    return len(names)
 
+
+terminated = count_people([merged["field_log"], merged["sync_log"]], "Active", "Terminated")
+reactivated = count_people([merged["field_log"], merged["sync_log"]], "Terminated", "Active")
+
+c1, c2 = st.columns(2)
+c1.metric("New hires added", f"{len(merged['new_hires']):,}")
+c2.metric("Active to Terminated", f"{terminated:,}")
+
+if reactivated:
+    st.caption(f"{reactivated:,} went the other way, Terminated to Active.")
+
+# Kept because these silently lose data if ignored.
 if len(merged["dropped"]):
     lost = merged["dropped"]["Actual Hours"].sum(skipna=True)
+    names = ", ".join(merged["dropped"]["Employee Full Name"].astype(str).head(5))
     st.warning(
-        f"{len(merged['dropped'])} employee(s) will be removed, taking "
-        f"{lost:,.2f} cumulative actual hours with them. Review the **Dropped** "
-        "tab before downloading."
+        f"{len(merged['dropped'])} removed for not appearing in the export, "
+        f"taking {lost:,.2f} cumulative hours: {names}"
+        + (" ..." if len(merged["dropped"]) > 5 else "")
     )
 
-if len(merged["new_dupes"]):
-    st.warning(
-        f"{len(merged['new_dupes'])} row(s) in the weekly export share a "
-        "name + hire date. Their hours were summed together into one row."
+if len(merged["ambiguous"]):
+    st.error(
+        f"{len(merged['ambiguous'])} name(s) have several possible rehire matches "
+        "and were left alone. Resolve them in the historical file before re-running: "
+        + ", ".join(merged["ambiguous"]["Employee Full Name"].astype(str))
     )
-
-if len(merged["hist_dupes"]):
-    st.warning(
-        f"{len(merged['hist_dupes'])} row(s) in the historical file share a "
-        "name + hire date. Their hours were summed together into one row."
-    )
-
-# --- Change log --------------------------------------------------------------
-st.subheader("Change log")
-tabs = st.tabs([
-    f"Field changes ({len(merged['field_log'])})",
-    f"Rehires linked ({len(merged['rehire_log'])})",
-    f"New hires ({len(merged['new_hires'])})",
-    f"Dropped ({len(merged['dropped'])})",
-    f"Duplicate sync ({len(merged['sync_log'])})",
-    f"Held back ({len(merged['deferred_log'])})",
-    f"Needs review ({len(merged['ambiguous'])})",
-    f"Hours added ({len(merged['hours_log'])})",
-    "Duplicates",
-    "Preview",
-])
-
-with tabs[0]:
-    if len(merged["field_log"]):
-        log = merged["field_log"]
-        fields = st.multiselect(
-            "Filter by field", sorted(log["Field"].unique()), key="field_filter"
-        )
-        if fields:
-            log = log[log["Field"].isin(fields)]
-        st.dataframe(log, use_container_width=True, hide_index=True)
-        st.caption("Counts by field: " + ", ".join(
-            f"{f} ({n})" for f, n in merged["field_log"]["Field"].value_counts().items()
-        ))
-    else:
-        st.info("No attribute changes this week.")
-
-with tabs[1]:
-    if len(merged["rehire_log"]):
-        st.dataframe(
-            merged["rehire_log"].sort_values("Hours carried forward", ascending=False),
-            use_container_width=True, hide_index=True,
-        )
-        st.caption(
-            "These employees came back under a rewritten hire date. Their cumulative "
-            "hours were carried onto the new row and the superseded row removed."
-        )
-    else:
-        st.info("No rehires detected this week.")
-
-with tabs[2]:
-    if len(merged["new_hires"]):
-        st.dataframe(
-            merged["new_hires"][
-                ["Employee Full Name", "Employment Status", "Hire Date", "Shift",
-                 "Department", "Reports To", "Job", "Temp Agency Code", "Actual Hours"]
-            ],
-            use_container_width=True, hide_index=True,
-        )
-    else:
-        st.info("No new hires this week.")
-
-with tabs[3]:
-    if len(merged["dropped"]):
-        st.dataframe(
-            merged["dropped"][
-                ["Employee Full Name", "Employment Status", "Hire Date", "Shift",
-                 "Department", "Reports To", "Job", "Actual Hours"]
-            ],
-            use_container_width=True, hide_index=True,
-        )
-        st.caption(
-            "These exist in the historical file but not in this week's export. "
-            "'Actual Hours' is their cumulative total to date."
-        )
-    else:
-        st.info("Every historical employee appeared in this week's export.")
-
-with tabs[4]:
-    if len(merged["sync_log"]):
-        log = merged["sync_log"]
-        non_temp = log[log["TEMP"] == "No"]
-        if len(non_temp):
-            st.warning(
-                f"{len(non_temp)} of these are regular employees matched on name "
-                "alone. Confirm they are the same person and not two people who "
-                "share a name."
-            )
-        st.dataframe(log, use_container_width=True, hide_index=True)
-        if len(merged["sync_groups"]):
-            st.caption("People with more than one row:")
-            st.dataframe(
-                merged["sync_groups"].sort_values("Rows", ascending=False),
-                use_container_width=True, hide_index=True,
-            )
-    elif len(merged["sync_groups"]):
-        st.info(
-            f"{len(merged['sync_groups'])} people have multiple rows, but their "
-            "selected fields already agree. Nothing to change."
-        )
-    else:
-        st.info("No selected fields to sync.")
-
-with tabs[5]:
-    if len(merged["deferred_log"]):
-        st.dataframe(merged["deferred_log"], use_container_width=True, hide_index=True)
-        st.caption(
-            "These are older stints. The export reports the status that stint "
-            "ended on, but the person's newest row is the authority, so the value "
-            "was left alone instead of being written and immediately re-synced. "
-            "Nothing here needs action - it's shown so the hold-back isn't silent."
-        )
-    else:
-        st.info("Nothing was held back this week.")
-
-with tabs[6]:
-    if len(merged["ambiguous"]):
-        st.dataframe(merged["ambiguous"], use_container_width=True, hide_index=True)
-        st.caption(
-            "This name appears on both sides but with more than one candidate row, "
-            "so pairing them automatically could hand one person's hours to another. "
-            "Resolve these in the historical file before re-running."
-        )
-    else:
-        st.info("Nothing needs manual review.")
-
-with tabs[7]:
-    if len(merged["hours_log"]):
-        st.dataframe(
-            merged["hours_log"].sort_values("Hours Added (Actual)", ascending=False),
-            use_container_width=True, hide_index=True,
-        )
-    else:
-        st.info("No hours were added this week.")
-
-with tabs[8]:
-    if len(merged["new_dupes"]):
-        st.markdown("**Weekly export**")
-        st.dataframe(
-            merged["new_dupes"][
-                ["Employee Full Name", "Hire Date", "Employment Status",
-                 "Temp Agency Code", "Shift", "Department", "Actual Hours"]
-            ].sort_values(["Employee Full Name", "Hire Date"]),
-            use_container_width=True, hide_index=True,
-        )
-    if len(merged["hist_dupes"]):
-        st.markdown("**Historical file**")
-        st.dataframe(
-            merged["hist_dupes"][
-                ["Employee Full Name", "Hire Date", "Employment Status",
-                 "Temp Agency Code", "Shift", "Department", "Actual Hours"]
-            ].sort_values(["Employee Full Name", "Hire Date"]),
-            use_container_width=True, hide_index=True,
-        )
-    if not len(merged["new_dupes"]) and not len(merged["hist_dupes"]):
-        st.info("No duplicate name + hire date combinations found.")
-
-with tabs[9]:
-    st.dataframe(out_df.head(200), use_container_width=True, hide_index=True)
-    st.caption(f"Showing the first 200 of {len(out_df):,} rows.")
 
 # --- Download ----------------------------------------------------------------
 st.subheader("Download")
