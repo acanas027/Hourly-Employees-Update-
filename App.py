@@ -456,54 +456,69 @@ def merge_rosters(hist: pd.DataFrame, new: pd.DataFrame, drop_missing: bool,
     result = hist.copy()
     hours_log, field_log, deferred_log = [], [], []
 
-    for key in matched:
-        h_row, n_row = hist.loc[key], new.loc[key]
+    if matched:
+        # --- Hours, vectorized ---------------------------------------------
+        # Elementwise add over aligned indexes. A per-row Python loop here cost
+        # seconds on every rerun, which reads as the app freezing.
+        h_hours = hist.loc[matched, HOURS_COLUMNS]
+        n_hours = new.loc[matched, HOURS_COLUMNS].apply(pd.to_numeric, errors="coerce")
+        h_hours = h_hours.apply(pd.to_numeric, errors="coerce")
 
-        added = {}
-        for col in HOURS_COLUMNS:
-            old_v, new_v = h_row[col], n_row[col]
-            if pd.isna(old_v) and pd.isna(new_v):
-                continue
-            total = (0 if pd.isna(old_v) else float(old_v)) + \
-                    (0 if pd.isna(new_v) else float(new_v))
-            result.at[key, col] = total
-            if pd.notna(new_v) and float(new_v) != 0:
-                added[col] = float(new_v)
+        both_blank = h_hours.isna() & n_hours.isna()
+        totals = (h_hours.fillna(0) + n_hours.fillna(0)).mask(both_blank)
+        result.loc[matched, HOURS_COLUMNS] = totals
 
-        if added:
+        contributed = n_hours.fillna(0).ne(0)
+        rows_with_hours = contributed.any(axis=1)
+        for key in n_hours.index[rows_with_hours]:
+            added = {c: round(float(n_hours.at[key, c]), 2)
+                     for c in HOURS_COLUMNS if contributed.at[key, c]}
             hours_log.append({
-                "Employee Full Name": h_row["Employee Full Name"],
-                "Hire Date": display_value(h_row["Hire Date"]),
-                **{c: round(v, 2) for c, v in added.items()},
-                "Hours Added (Actual)": round(added.get("Actual Hours", 0), 2),
+                "Employee Full Name": hist.at[key, "Employee Full Name"],
+                "Hire Date": display_value(hist.at[key, "Hire Date"]),
+                **added,
+                "Hours Added (Actual)": round(
+                    float(n_hours.at[key, "Actual Hours"] or 0), 2
+                ),
             })
 
-        for col in ATTRIBUTE_COLUMNS:
-            old_v, new_v = h_row[col], n_row[col]
-            if not values_differ(old_v, new_v):
-                continue
+        # --- Attributes ------------------------------------------------------
+        # values_differ is careful but slow. A plain string comparison flags a
+        # superset of real changes, so it cheaply narrows the candidates and
+        # values_differ only runs on those.
+        h_attr = hist.loc[matched, ATTRIBUTE_COLUMNS]
+        n_attr = new.loc[matched, ATTRIBUTE_COLUMNS]
+        candidates = h_attr.astype(str).values != n_attr.astype(str).values
 
-            if col in sync_owned and key not in newest_keys:
-                # An older stint. The sync sets this field from the person's
-                # newest row, so writing the export's value here would only be
-                # undone a moment later.
-                deferred_log.append({
-                    "Employee Full Name": h_row["Employee Full Name"],
-                    "Hire Date": display_value(h_row["Hire Date"]),
+        for r_i, key in enumerate(matched):
+            for c_i, col in enumerate(ATTRIBUTE_COLUMNS):
+                if not candidates[r_i, c_i]:
+                    continue
+                old_v, new_v = h_attr.iat[r_i, c_i], n_attr.iat[r_i, c_i]
+                if not values_differ(old_v, new_v):
+                    continue
+
+                if col in sync_owned and key not in newest_keys:
+                    # An older stint. The sync sets this field from the person's
+                    # newest row, so writing the export's value here would only
+                    # be undone a moment later.
+                    deferred_log.append({
+                        "Employee Full Name": hist.at[key, "Employee Full Name"],
+                        "Hire Date": display_value(hist.at[key, "Hire Date"]),
+                        "Field": col,
+                        "Export says": display_value(new_v),
+                        "Left as": display_value(old_v),
+                    })
+                    continue
+
+                result.at[key, col] = new_v
+                field_log.append({
+                    "Employee Full Name": hist.at[key, "Employee Full Name"],
+                    "Hire Date": display_value(hist.at[key, "Hire Date"]),
                     "Field": col,
-                    "Export says": display_value(new_v),
-                    "Left as": display_value(old_v),
+                    "Was": display_value(old_v),
+                    "Now": display_value(new_v),
                 })
-                continue
-
-            result.at[key, col] = new_v
-            field_log.append({
-                "Employee Full Name": h_row["Employee Full Name"],
-                "Hire Date": display_value(h_row["Hire Date"]),
-                "Field": col,
-                "Was": display_value(old_v),
-                "Now": display_value(new_v),
-            })
 
     new_hires = new.loc[new_hire_keys].copy() if new_hire_keys else new.iloc[0:0].copy()
     dropped = hist.loc[dropped_keys].copy() if dropped_keys else hist.iloc[0:0].copy()
@@ -646,6 +661,37 @@ def to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Employee Hours Test") ->
 
 
 # ----------------------------------------------------------------------------
+# Cached wrappers
+# ----------------------------------------------------------------------------
+# Streamlit reruns the whole script on every widget interaction. Without these
+# the app re-parses both files, re-runs the merge and rebuilds the workbook on
+# each click, which on a shared container reads as the app freezing for ~30s.
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def load_table_cached(file_bytes: bytes, filename: str):
+    buf = io.BytesIO(file_bytes)
+    buf.name = filename
+    return load_table(buf)
+
+
+@st.cache_data(show_spinner="Merging rosters...", max_entries=8)
+def merge_cached(hist_df, new_df, drop_missing, link_rehire, sync_fields, sync_temp_only):
+    return merge_rosters(
+        hist_df, new_df,
+        drop_missing=drop_missing,
+        link_rehire=link_rehire,
+        sync_fields=list(sync_fields),
+        sync_temp_only=sync_temp_only,
+    )
+
+
+@st.cache_data(show_spinner="Building workbook...", max_entries=4)
+def build_excel_cached(df):
+    return to_excel_bytes(df)
+
+
+# ----------------------------------------------------------------------------
 # UI
 # ----------------------------------------------------------------------------
 
@@ -657,62 +703,57 @@ st.caption(
     "Employees are matched on **Employee Full Name + Hire Date**."
 )
 
+# Fixed behaviour. These were toggles; they are now always on.
+LINK_REHIRE = True
+DROP_MISSING = True
+SORT_OUTPUT = True
+SYNC_FIELDS = list(ATTRIBUTE_COLUMNS)   # every attribute field
+SYNC_TEMP_ONLY = False                  # applies to everyone, not just TEMPs
+
+link_rehire = LINK_REHIRE
+drop_missing = DROP_MISSING
+sort_output = SORT_OUTPUT
+sync_fields = SYNC_FIELDS
+sync_temp_only = SYNC_TEMP_ONLY
+
 with st.sidebar:
-    st.header("Options")
-    link_rehire = st.checkbox(
-        "Link rehires and carry their hours forward",
-        value=True,
-        help=(
-            "When someone's Hire Date is rewritten between exports, treat it as a "
-            "rehire rather than a departure plus a new hire, so their cumulative "
-            "hours survive. Inactive-to-active needs no linking - the hire date "
-            "doesn't move, so those hours already carry."
-        ),
+    st.header("How this runs")
+
+    st.markdown(
+        "**Matching**  \n"
+        "Employee Full Name + Hire Date."
     )
-    drop_missing = st.checkbox(
-        "Drop employees missing from the weekly export",
-        value=True,
-        help=(
-            "On: anyone absent from this week's export is removed, along with their "
-            "cumulative hours. Off: they stay in the file untouched. Linked rehires "
-            "are exempt either way."
-        ),
+    st.markdown(
+        "**Hours**  \n"
+        "Every hours column accumulates week over week."
     )
-    sort_output = st.checkbox(
-        "Sort output by Employee Full Name",
-        value=False,
-        help="Off keeps the historical row order and appends new hires at the bottom.",
+    st.markdown(
+        "**Rehires**  \n"
+        "A rewritten hire date is treated as a rehire, not a departure plus a "
+        "new hire, so cumulative hours carry forward."
     )
-    st.divider()
-    st.subheader("Duplicate rows")
-    st.caption(
-        "When one person has several rows, the newest row wins and older rows "
-        "are brought into line. No row is removed and no hours move."
+    st.markdown(
+        "**Missing from the export**  \n"
+        "Removed from the file, along with their cumulative hours. "
+        "Check the Dropped tab before downloading."
     )
-    sync_fields = st.multiselect(
-        "Fields to sync onto older rows",
-        options=ATTRIBUTE_COLUMNS,
-        default=["Employment Status"],
-        help=(
-            "Employment Status describes the person, so it shouldn't differ "
-            "between their rows. Shift, Department, Reports To and Job describe "
-            "a particular stint - syncing those rewrites where someone worked "
-            "while earning the hours on that row."
-        ),
+    st.markdown(
+        "**Duplicate rows**  \n"
+        "When one person has several rows, the newest row is the authority for "
+        "every attribute field and older rows are brought into line. No row is "
+        "removed and no hours move."
     )
-    sync_temp_only = st.checkbox(
-        "Only sync TEMP- names",
-        value=False,
-        help=(
-            "Matching is on name alone. Repeat TEMP stints are reliably the same "
-            "person; two regular employees can share a name and are not."
-        ),
-    )
-    st.divider()
-    st.caption(
-        "Hours columns accumulate. Status, pay rule, agency, rate, rehire date, "
-        "profit center, shift, department, supervisor, and job are overwritten "
-        "when they change. Name and hire date are never touched."
+
+    with st.expander("Fields synced from the newest row"):
+        st.write("\n".join(f"- {c}" for c in SYNC_FIELDS))
+        st.caption(
+            "Because the newest row owns these, the weekly export no longer "
+            "updates them on older rows - see the Held back tab."
+        )
+
+    st.markdown(
+        "**Never changed**  \n"
+        "Employee Full Name and Hire Date. Output is sorted by name."
     )
 
 col_a, col_b = st.columns(2)
@@ -730,13 +771,13 @@ if not (hist_file and new_file):
     st.stop()
 
 try:
-    hist_df, hist_meta = load_table(hist_file)
+    hist_df, hist_meta = load_table_cached(hist_file.getvalue(), hist_file.name)
 except Exception as exc:
     st.error(f"Could not read the historical file: {exc}")
     st.stop()
 
 try:
-    new_df, new_meta = load_table(new_file)
+    new_df, new_meta = load_table_cached(new_file.getvalue(), new_file.name)
 except Exception as exc:
     st.error(f"Could not read the weekly export: {exc}")
     st.stop()
@@ -745,12 +786,10 @@ period = new_meta.get("Time Period", "")
 if period:
     st.success(f"Weekly export period: **{period}**")
 
-merged = merge_rosters(
+merged = merge_cached(
     hist_df, new_df,
-    drop_missing=drop_missing,
-    link_rehire=link_rehire,
-    sync_fields=sync_fields,
-    sync_temp_only=sync_temp_only,
+    drop_missing, link_rehire,
+    tuple(sync_fields), sync_temp_only,
 )
 out_df = merged["result"]
 
@@ -767,7 +806,7 @@ m2.metric("Matched & updated", f"{merged['matched_count']:,}")
 m3.metric("Rehires linked", f"{len(merged['rehire_log']):,}")
 m4.metric("New hires added", f"{len(merged['new_hires']):,}")
 m5.metric(
-    "Dropped" if drop_missing else "Missing (kept)",
+    "Dropped",
     f"{len(merged['dropped']):,}",
 )
 m6.metric("Rows out", f"{len(out_df):,}")
@@ -781,12 +820,10 @@ st.caption(
     f"Hours preserved through rehire links: {carried:,.2f}."
 )
 
-if sync_fields:
-    st.caption(
-        "Synced across duplicate rows: " + ", ".join(sync_fields) +
-        ". The newest row is the authority for these, so the weekly overwrite "
-        "leaves them alone on older rows."
-    )
+st.caption(
+    "All attribute fields are synced from each person's newest row, so the "
+    "weekly export no longer updates them on older rows."
+)
 
 # --- Warnings ----------------------------------------------------------------
 if len(merged["ambiguous"]):
@@ -797,7 +834,7 @@ if len(merged["ambiguous"]):
         "resolve them by hand."
     )
 
-if drop_missing and len(merged["dropped"]):
+if len(merged["dropped"]):
     lost = merged["dropped"]["Actual Hours"].sum(skipna=True)
     st.warning(
         f"{len(merged['dropped'])} employee(s) will be removed, taking "
@@ -978,11 +1015,15 @@ label = re.sub(r"[^0-9A-Za-z]+", "_", period).strip("_") if period else \
     datetime.now().strftime("%Y_%m_%d")
 filename = f"Employee_Hours_Historical_{label}.xlsx"
 
-st.download_button(
-    "Download updated historical file",
-    data=to_excel_bytes(out_df),
-    file_name=filename,
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    type="primary",
-)
+if st.button("Prepare file for download", type="primary"):
+    st.session_state["excel_ready"] = True
+
+if st.session_state.get("excel_ready"):
+    st.download_button(
+        "Download updated historical file",
+        data=build_excel_cached(out_df),
+        file_name=filename,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+    )
 st.caption(f"`{filename}` — upload this as the historical file next week.")
