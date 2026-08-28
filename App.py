@@ -1249,9 +1249,9 @@ def build_excel_cached(df):
 # UI
 # ----------------------------------------------------------------------------
 
-st.set_page_config(page_title="Employee Hours Roster", page_icon="", layout="wide")
+st.set_page_config(page_title="Employee Hours Roster Updater", page_icon="", layout="wide")
 
-st.title("Employee Hours Roster")
+st.title("Employee Hours Roster Updater")
 st.caption(
     "Upload only this week's Employee Hours export. The cumulative historical "
     "roster is stored and updated automatically in Google Sheets. Employees are "
