@@ -867,16 +867,32 @@ def get_google_spreadsheet():
 # Every rerun previously called get_all_values() on four tabs over the network.
 # Values are now cached and invalidated explicitly after a successful commit.
 
+@st.cache_resource(show_spinner=False)
+def _cache_state() -> dict:
+    """One mutable dict shared by every session in this server process.
+
+    The cache version must live beside the cache itself. Holding it in
+    st.session_state was wrong: cache_data is global and persists, while
+    session_state resets on every page load, so a returning visitor started
+    back at version 0 and hit the stale pre-commit read.
+    """
+    return {"version": 0}
+
+
 def sheet_version() -> int:
-    """Bumped after each commit so cached reads are invalidated on demand."""
-    return st.session_state.get("_sheet_version", 0)
+    return _cache_state()["version"]
 
 
 def bump_sheet_cache():
-    st.session_state["_sheet_version"] = sheet_version() + 1
+    """Invalidate cached tab reads after a write."""
+    _cache_state()["version"] += 1
+    try:
+        fetch_tab_values.clear()
+    except Exception:
+        pass
 
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def fetch_tab_values(title: str, version: int) -> list[list]:
     """Read one tab. `version` is part of the cache key, not used in the body."""
     book = get_google_spreadsheet()
