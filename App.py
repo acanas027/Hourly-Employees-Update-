@@ -6,19 +6,22 @@ Merges a weekly "Employee Hours" export into the cumulative historical roster.
   1. Sums the new week's hours into the running totals
   2. Appends new hires with their information
   3. Overwrites attribute fields that changed (status, department, supervisor, etc.)
-  4. Emits an updated .xlsx that becomes next week's historical file
+  4. Persists the cumulative historical roster in Google Sheets
+  5. Archives each weekly input so prior weeks can be safely replaced/replayed
 
 Matching key: Employee Full Name + Hire Date (strict).
 """
 
 import csv
+import hashlib
 import io
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 
+import gspread
 import pandas as pd
 import streamlit as st
-from openpyxl import Workbook, load_workbook
+from openpyxl import Workbook
 from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
 
@@ -328,10 +331,6 @@ def sync_duplicate_rows(df: pd.DataFrame, fields: list, temp_only: bool = False)
     chiefly Employment Status - should not disagree between them, so the most
     recent row wins and the older rows are brought into line. No row is removed
     and no hours move; each row keeps the hours it earned.
-
-    Stint-level fields (Shift, Department, Reports To, Job) are deliberately
-    not synced by default: an old row's shift describes where that person
-    actually worked while earning those hours.
     """
     if not fields:
         return df, pd.DataFrame(), pd.DataFrame()
@@ -396,10 +395,6 @@ def newest_key_per_person(hist, new, temp_only: bool = False) -> set:
     the duplicate sync owns. Without this the two stages fight every week: the
     export reports an old stint as Terminated, the sync reports the person as
     Active, and the change log fills with a flip that nets to nothing.
-
-    Rows the sync ignores - blank names, and non-TEMP names when the sync is
-    limited to TEMPs - are all treated as newest so their normal update path
-    is untouched.
     """
     frames = [
         hist[["Employee Full Name", "Hire Date", "Rehire Date"]],
@@ -661,12 +656,547 @@ def to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Employee Hours Test") ->
 
 
 # ----------------------------------------------------------------------------
+# Google Sheets persistence
+# ----------------------------------------------------------------------------
+# Spreadsheet tabs:
+#   Historical   Current cumulative roster used by the app/download button
+#   Baseline     One-time snapshot of Historical when this version went live
+#   Weekly_Data  Raw canonical rows from every post-go-live weekly upload
+#   Update_Log   One row per processed week, including hash/status/audit fields
+#
+# Baseline + Weekly_Data make replacement safe: if an old week is corrected,
+# the app replays every stored week in sequence through THE SAME merge_rosters()
+# function instead of trying to subtract data from cumulative totals.
+#
+# A brand-new week does NOT replay. Historical already equals the replay of
+# every prior week, so merging the new week straight into it is identical and
+# runs in constant time however many weeks are stored.
+
+HISTORICAL_SHEET = "Historical"
+BASELINE_SHEET = "Baseline"
+WEEKLY_DATA_SHEET = "Weekly_Data"
+UPDATE_LOG_SHEET = "Update_Log"
+
+WEEKLY_META_COLUMNS = [
+    "__Period Key",
+    "__Period",
+    "__Sequence",
+    "__File Hash",
+    "__Source Filename",
+]
+WEEKLY_STORAGE_COLUMNS = WEEKLY_META_COLUMNS + CANONICAL_COLUMNS
+
+LOG_COLUMNS = [
+    "Period Key",
+    "Period",
+    "Sequence",
+    "File Hash",
+    "Source Filename",
+    "Status",
+    "Processed At UTC",
+    "Rows",
+    "New Hires",
+    "Active to Terminated",
+    "Terminated to Active",
+    "Actual Hours Added",
+]
+
+
+def file_sha256(file_bytes: bytes) -> str:
+    return hashlib.sha256(file_bytes).hexdigest()
+
+
+def normalize_period_display(period) -> str:
+    return re.sub(r"\s+", " ", str(period or "").strip())
+
+
+def canonical_period_key(period) -> str:
+    """Stable key for duplicate detection; prefers the two dates in Time Period."""
+    display = normalize_period_display(period)
+    date_tokens = re.findall(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", display)
+    parsed = []
+    for token in date_tokens[:2]:
+        dt = pd.to_datetime(token, errors="coerce")
+        if pd.notna(dt):
+            parsed.append(dt.normalize())
+    if len(parsed) >= 2:
+        return f"{parsed[0]:%Y-%m-%d}__{parsed[1]:%Y-%m-%d}"
+    return re.sub(r"\s+", " ", display.upper())
+
+
+def _sheet_cell_value(value, column=None):
+    """Convert pandas/numpy values into JSON-safe Google Sheets cell values."""
+    if pd.isna(value):
+        return ""
+    if column in DATE_COLUMNS:
+        dt = pd.to_datetime(value, errors="coerce")
+        return "" if pd.isna(dt) else dt.strftime("%Y-%m-%d")
+    if isinstance(value, (pd.Timestamp, datetime)):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    if hasattr(value, "item") and not isinstance(value, (str, bytes)):
+        try:
+            value = value.item()
+        except (ValueError, AttributeError):
+            pass
+    return value
+
+
+def dataframe_to_sheet_rows(df: pd.DataFrame, columns: list) -> list[list]:
+    rows = []
+    for _, row in df.iterrows():
+        rows.append([_sheet_cell_value(row.get(col, ""), col) for col in columns])
+    return rows
+
+
+def roster_from_sheet_values(values: list[list], source_name: str) -> pd.DataFrame:
+    """Read a Google Sheet table into the same canonical dataframe as load_table."""
+    if not values:
+        return pd.DataFrame(columns=CANONICAL_COLUMNS)
+
+    headers = [_normalize_header(h) for h in values[0]]
+    headers = [COLUMN_ALIASES.get(h, h) for h in headers]
+
+    missing = [c for c in CANONICAL_COLUMNS if c not in headers]
+    if missing:
+        raise ValueError(
+            f"Google Sheet tab '{source_name}' is missing expected column(s): "
+            + ", ".join(missing)
+        )
+
+    rows = values[1:]
+    width = len(headers)
+    padded = [r + [""] * (width - len(r)) for r in rows]
+    df = pd.DataFrame(padded, columns=headers)
+    df = df[CANONICAL_COLUMNS].copy()
+    df = df.replace("", pd.NA)
+
+    blank = df["Employee Full Name"].isna() & df["Hire Date"].isna()
+    df = df[~blank].reset_index(drop=True)
+
+    for col in HOURS_COLUMNS:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    for col in DATE_COLUMNS:
+        df[col] = pd.to_datetime(df[col], errors="coerce")
+
+    return df
+
+
+@st.cache_resource(show_spinner=False)
+def get_google_spreadsheet():
+    """Authenticate with a service account stored in Streamlit secrets."""
+    try:
+        credentials = dict(st.secrets["gcp_service_account"])
+        sheet_id = str(st.secrets["GOOGLE_SHEET_ID"]).strip()
+    except Exception as exc:
+        raise RuntimeError(
+            "Google Sheets secrets are not configured. Add GOOGLE_SHEET_ID and "
+            "[gcp_service_account] to Streamlit secrets."
+        ) from exc
+
+    # TOML often stores literal \\n sequences; Google expects real newlines.
+    if "private_key" in credentials:
+        credentials["private_key"] = credentials["private_key"].replace("\\n", "\n")
+
+    client = gspread.service_account_from_dict(credentials)
+    return client.open_by_key(sheet_id)
+
+
+# --- PATCH 1: cached tab reads -----------------------------------------------
+# Every rerun previously called get_all_values() on four tabs over the network.
+# Values are now cached and invalidated explicitly after a successful commit.
+
+def sheet_version() -> int:
+    """Bumped after each commit so cached reads are invalidated on demand."""
+    return st.session_state.get("_sheet_version", 0)
+
+
+def bump_sheet_cache():
+    st.session_state["_sheet_version"] = sheet_version() + 1
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_tab_values(title: str, version: int) -> list[list]:
+    """Read one tab. `version` is part of the cache key, not used in the body."""
+    book = get_google_spreadsheet()
+    try:
+        return book.worksheet(title).get_all_values()
+    except gspread.WorksheetNotFound:
+        return []
+
+
+def get_or_create_worksheet(book, title: str, rows: int, cols: int):
+    try:
+        return book.worksheet(title)
+    except gspread.WorksheetNotFound:
+        return book.add_worksheet(title=title, rows=rows, cols=cols)
+
+
+def ensure_sheet_header(ws, header: list[str]):
+    first_row = ws.row_values(1)
+    if not first_row:
+        if ws.col_count < len(header):
+            ws.resize(cols=len(header))
+        ws.update([header], "A1", raw=True)
+        return
+
+    normalized = [_normalize_header(v) for v in first_row[:len(header)]]
+    if normalized != header:
+        raise ValueError(
+            f"Google Sheet tab '{ws.title}' has an unexpected header. "
+            "Do not rename/reorder its system columns."
+        )
+
+
+def read_roster_worksheet(ws) -> pd.DataFrame:
+    return roster_from_sheet_values(ws.get_all_values(), ws.title)
+
+
+def write_roster_worksheet(ws, df: pd.DataFrame):
+    values = [CANONICAL_COLUMNS] + dataframe_to_sheet_rows(df, CANONICAL_COLUMNS)
+    needed_rows = max(1000, len(values) + 20)
+    needed_cols = max(26, len(CANONICAL_COLUMNS))
+    if ws.row_count < needed_rows or ws.col_count < needed_cols:
+        ws.resize(rows=max(ws.row_count, needed_rows), cols=max(ws.col_count, needed_cols))
+    ws.clear()
+    ws.update(values, "A1", raw=True)
+    ws.freeze(rows=1)
+
+
+def read_update_log(ws) -> pd.DataFrame:
+    values = ws.get_all_values()
+    if len(values) <= 1:
+        return pd.DataFrame(columns=LOG_COLUMNS)
+    width = len(LOG_COLUMNS)
+    rows = [r + [""] * (width - len(r)) for r in values[1:]]
+    return pd.DataFrame([r[:width] for r in rows], columns=LOG_COLUMNS)
+
+
+def find_log_row(log_df: pd.DataFrame, period_key: str):
+    if log_df.empty:
+        return None
+    matches = log_df.index[log_df["Period Key"].astype(str) == period_key].tolist()
+    return None if not matches else log_df.loc[matches[-1]].to_dict()
+
+
+def next_sequence(log_df: pd.DataFrame) -> int:
+    if log_df.empty:
+        return 1
+    seq = pd.to_numeric(log_df["Sequence"], errors="coerce")
+    return 1 if seq.dropna().empty else int(seq.max()) + 1
+
+
+def upsert_log_row(ws, record: dict):
+    values = ws.get_all_values()
+    row_number = None
+    for i, row in enumerate(values[1:], start=2):
+        if row and str(row[0]) == str(record["Period Key"]):
+            row_number = i
+            break
+
+    row_values = [_sheet_cell_value(record.get(col, "")) for col in LOG_COLUMNS]
+    last_col = get_column_letter(len(LOG_COLUMNS))
+    if row_number is None:
+        ws.append_row(row_values, value_input_option="RAW")
+    else:
+        ws.update([row_values], f"A{row_number}:{last_col}{row_number}", raw=True)
+
+
+def _contiguous_blocks(row_numbers: list[int]) -> list[tuple[int, int]]:
+    if not row_numbers:
+        return []
+    nums = sorted(row_numbers)
+    blocks = []
+    start = prev = nums[0]
+    for n in nums[1:]:
+        if n == prev + 1:
+            prev = n
+            continue
+        blocks.append((start, prev))
+        start = prev = n
+    blocks.append((start, prev))
+    return blocks
+
+
+def archive_weekly_period(ws, new_df: pd.DataFrame, period_key: str, period: str,
+                          sequence: int, file_hash: str, filename: str):
+    """Replace this period's archived rows in-place, or append it if it is new."""
+    existing = ws.get_all_values()
+    rows_for_period = [
+        i for i, row in enumerate(existing[1:], start=2)
+        if row and str(row[0]) == period_key
+    ]
+    insert_at = min(rows_for_period) if rows_for_period else None
+
+    # Delete bottom-up so row numbers above each deleted block remain valid.
+    for start, end in reversed(_contiguous_blocks(rows_for_period)):
+        ws.delete_rows(start, end)
+
+    archive_rows = []
+    for _, row in new_df.iterrows():
+        meta = [period_key, period, sequence, file_hash, filename]
+        canonical = [_sheet_cell_value(row[col], col) for col in CANONICAL_COLUMNS]
+        archive_rows.append(meta + canonical)
+
+    if not archive_rows:
+        raise ValueError("The weekly export contains no employee rows to archive.")
+
+    if insert_at is None:
+        ws.append_rows(archive_rows, value_input_option="RAW")
+    else:
+        ws.insert_rows(
+            archive_rows,
+            row=insert_at,
+            value_input_option="RAW",
+            inherit_from_before=(insert_at > 1),
+        )
+
+
+def weekly_groups_from_archive(ws) -> list[dict]:
+    values = ws.get_all_values()
+    if len(values) <= 1:
+        return []
+
+    width = len(WEEKLY_STORAGE_COLUMNS)
+    rows = [r + [""] * (width - len(r)) for r in values[1:]]
+    archive = pd.DataFrame([r[:width] for r in rows], columns=WEEKLY_STORAGE_COLUMNS)
+    archive["__Sequence"] = pd.to_numeric(archive["__Sequence"], errors="coerce")
+    archive = archive[archive["__Period Key"].astype(str).str.strip() != ""].copy()
+
+    groups = []
+    for (sequence, period_key), block in archive.groupby(
+        ["__Sequence", "__Period Key"], sort=True, dropna=False
+    ):
+        if pd.isna(sequence):
+            continue
+
+        week = block[CANONICAL_COLUMNS].copy().replace("", pd.NA)
+        for col in HOURS_COLUMNS:
+            week[col] = pd.to_numeric(week[col], errors="coerce")
+        for col in DATE_COLUMNS:
+            week[col] = pd.to_datetime(week[col], errors="coerce")
+
+        groups.append({
+            "sequence": int(sequence),
+            "period_key": str(period_key),
+            "period": str(block["__Period"].iloc[0]),
+            "file_hash": str(block["__File Hash"].iloc[0]),
+            "filename": str(block["__Source Filename"].iloc[0]),
+            "df": week.reset_index(drop=True),
+        })
+
+    groups.sort(key=lambda x: x["sequence"])
+    return groups
+
+
+def sort_historical_output(df: pd.DataFrame) -> pd.DataFrame:
+    if not SORT_OUTPUT:
+        return df.reset_index(drop=True)
+    return df.sort_values(
+        "Employee Full Name", key=lambda s: s.astype(str).str.upper()
+    ).reset_index(drop=True)
+
+
+# --- PATCH 3a: replay now uses the cached merge -------------------------------
+
+def rebuild_from_baseline(baseline_df: pd.DataFrame, weekly_ws, target_period_key=None):
+    """Replay every archived week. Only needed when correcting a past week."""
+    current = baseline_df.copy()
+    target_merge = None
+    replay_ambiguous = []
+
+    for group in weekly_groups_from_archive(weekly_ws):
+        merged = merge_cached(
+            current,
+            group["df"],
+            DROP_MISSING,
+            LINK_REHIRE,
+            tuple(SYNC_FIELDS),
+            SYNC_TEMP_ONLY,
+        )
+        current = sort_historical_output(merged["result"])
+
+        if len(merged["ambiguous"]):
+            tmp = merged["ambiguous"].copy()
+            tmp.insert(0, "Period", group["period"])
+            replay_ambiguous.append(tmp)
+
+        if group["period_key"] == target_period_key:
+            target_merge = merged
+
+    all_ambiguous = (
+        pd.concat(replay_ambiguous, ignore_index=True)
+        if replay_ambiguous else pd.DataFrame()
+    )
+    return current, target_merge, all_ambiguous
+
+
+def count_people(log, was, now):
+    """Distinct people whose Employment Status moved from `was` to `now`."""
+    names = set()
+    for frame in log:
+        if not len(frame):
+            continue
+        if not {"Field", "Was", "Now"} <= set(frame.columns):
+            continue
+        hit = frame[
+            (frame["Field"] == "Employment Status")
+            & (frame["Was"] == was)
+            & (frame["Now"] == now)
+        ]
+        names |= {normalized_name(v) for v in hit["Employee Full Name"]}
+    names.discard("")
+    return len(names)
+
+
+def merge_summary(merged: dict, weekly_df: pd.DataFrame) -> dict:
+    terminated = count_people(
+        [merged["field_log"], merged["sync_log"]], "Active", "Terminated"
+    )
+    reactivated = count_people(
+        [merged["field_log"], merged["sync_log"]], "Terminated", "Active"
+    )
+    actual_added = pd.to_numeric(weekly_df["Actual Hours"], errors="coerce").sum(skipna=True)
+    return {
+        "Rows": len(weekly_df),
+        "New Hires": len(merged["new_hires"]),
+        "Active to Terminated": terminated,
+        "Terminated to Active": reactivated,
+        "Actual Hours Added": round(float(actual_added), 2),
+    }
+
+
+# --- PATCH 2: cached reads, Weekly_Data no longer read at startup -------------
+
+def initialize_google_backend():
+    """Create system tabs and snapshot Historical -> Baseline exactly once."""
+    book = get_google_spreadsheet()
+    historical_ws = get_or_create_worksheet(book, HISTORICAL_SHEET, rows=5000, cols=26)
+    baseline_ws = get_or_create_worksheet(book, BASELINE_SHEET, rows=5000, cols=26)
+    weekly_ws = get_or_create_worksheet(
+        book, WEEKLY_DATA_SHEET, rows=5000, cols=len(WEEKLY_STORAGE_COLUMNS)
+    )
+    log_ws = get_or_create_worksheet(book, UPDATE_LOG_SHEET, rows=500, cols=len(LOG_COLUMNS))
+
+    ensure_sheet_header(weekly_ws, WEEKLY_STORAGE_COLUMNS)
+    ensure_sheet_header(log_ws, LOG_COLUMNS)
+
+    v = sheet_version()
+    historical_values = fetch_tab_values(HISTORICAL_SHEET, v)
+    baseline_values = fetch_tab_values(BASELINE_SHEET, v)
+
+    # Historical/Baseline are allowed to be brand-new blank tabs.
+    historical_df = (
+        roster_from_sheet_values(historical_values, HISTORICAL_SHEET)
+        if historical_values else pd.DataFrame(columns=CANONICAL_COLUMNS)
+    )
+    baseline_df = (
+        roster_from_sheet_values(baseline_values, BASELINE_SHEET)
+        if baseline_values else pd.DataFrame(columns=CANONICAL_COLUMNS)
+    )
+
+    if baseline_df.empty:
+        if historical_df.empty:
+            raise RuntimeError(
+                "The Google Sheet is connected, but the 'Historical' tab is empty. "
+                "For the one-time migration, paste/import your CURRENT historical "
+                "roster into the Historical tab with the same A-V headers, then rerun."
+            )
+        write_roster_worksheet(baseline_ws, historical_df)
+        bump_sheet_cache()
+        baseline_df = historical_df.copy()
+
+    # If Historical was accidentally cleared after Baseline existed, restore it
+    # deterministically from Baseline + archived weeks.
+    if historical_df.empty:
+        rebuilt, _, _ = rebuild_from_baseline(baseline_df, weekly_ws)
+        write_roster_worksheet(historical_ws, rebuilt)
+        bump_sheet_cache()
+        historical_df = rebuilt
+
+    return {
+        "book": book,
+        "historical_ws": historical_ws,
+        "baseline_ws": baseline_ws,
+        "weekly_ws": weekly_ws,
+        "log_ws": log_ws,
+        "historical_df": historical_df,
+        "baseline_df": baseline_df,
+    }
+
+
+# --- PATCH 3b: append for a new week, replay only for corrections -------------
+
+def process_week_into_google(backend: dict, new_df: pd.DataFrame, period: str,
+                             period_key: str, file_hash: str, filename: str,
+                             sequence: int, mode: str = "append"):
+    """Archive one week, update Historical, commit the audit log last.
+
+    mode="append"  a brand-new latest week. Historical already equals the replay
+                   of every prior week, so merging this week straight into it
+                   gives the identical result in constant time however many
+                   weeks are stored.
+    mode="replay"  correcting or resuming a week. Rebuild from Baseline through
+                   the whole archive, because earlier weeks may now differ.
+    """
+    log_ws = backend["log_ws"]
+    weekly_ws = backend["weekly_ws"]
+    historical_ws = backend["historical_ws"]
+
+    pending = {
+        "Period Key": period_key,
+        "Period": period,
+        "Sequence": sequence,
+        "File Hash": file_hash,
+        "Source Filename": filename,
+        "Status": "PENDING",
+        "Processed At UTC": "",
+        "Rows": len(new_df),
+        "New Hires": "",
+        "Active to Terminated": "",
+        "Terminated to Active": "",
+        "Actual Hours Added": "",
+    }
+    upsert_log_row(log_ws, pending)
+
+    # Always replace the period's archive rows, whichever mode. That makes a
+    # PENDING transaction safely resumable and prevents duplicate raw rows.
+    archive_weekly_period(
+        weekly_ws, new_df, period_key, period, sequence, file_hash, filename
+    )
+
+    if mode == "append":
+        target_merge = merge_cached(
+            backend["historical_df"], new_df,
+            DROP_MISSING, LINK_REHIRE, tuple(SYNC_FIELDS), SYNC_TEMP_ONLY,
+        )
+        final_df = sort_historical_output(target_merge["result"])
+        replay_ambiguous = pd.DataFrame()
+    else:
+        final_df, target_merge, replay_ambiguous = rebuild_from_baseline(
+            backend["baseline_df"], weekly_ws, target_period_key=period_key
+        )
+        if target_merge is None:
+            raise RuntimeError("The uploaded period could not be found after archiving.")
+
+    write_roster_worksheet(historical_ws, final_df)
+
+    summary = merge_summary(target_merge, new_df)
+    committed = {
+        **pending,
+        "Status": "COMMITTED",
+        "Processed At UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        **summary,
+    }
+    upsert_log_row(log_ws, committed)
+
+    bump_sheet_cache()
+    backend["historical_df"] = final_df
+    return final_df, target_merge, replay_ambiguous, committed
+
+
+# ----------------------------------------------------------------------------
 # Cached wrappers
 # ----------------------------------------------------------------------------
-# Streamlit reruns the whole script on every widget interaction. Without these
-# the app re-parses both files, re-runs the merge and rebuilds the workbook on
-# each click, which on a shared container reads as the app freezing for ~30s.
-
 
 @st.cache_data(show_spinner=False, max_entries=4)
 def load_table_cached(file_bytes: bytes, filename: str):
@@ -675,7 +1205,7 @@ def load_table_cached(file_bytes: bytes, filename: str):
     return load_table(buf)
 
 
-@st.cache_data(show_spinner="Merging rosters...", max_entries=8)
+@st.cache_data(show_spinner="Merging rosters...", max_entries=64)
 def merge_cached(hist_df, new_df, drop_missing, link_rehire, sync_fields, sync_temp_only):
     return merge_rosters(
         hist_df, new_df,
@@ -699,8 +1229,9 @@ st.set_page_config(page_title="Employee Hours Roster Updater", page_icon="📋",
 
 st.title("Employee Hours Roster Updater")
 st.caption(
-    "Roll a weekly hours export into the cumulative roster. "
-    "Employees are matched on **Employee Full Name + Hire Date**."
+    "Upload only this week's Employee Hours export. The cumulative historical "
+    "roster is stored and updated automatically in Google Sheets. Employees are "
+    "matched on **Employee Full Name + Hire Date**."
 )
 
 # Fixed behaviour. These were toggles; they are now always on.
@@ -720,6 +1251,11 @@ with st.sidebar:
     st.header("How this runs")
 
     st.markdown(
+        "**Historical storage**  \n"
+        "Google Sheets is the source of truth. You no longer upload last week's "
+        "historical file."
+    )
+    st.markdown(
         "**Matching**  \n"
         "Employee Full Name + Hire Date."
     )
@@ -734,8 +1270,7 @@ with st.sidebar:
     )
     st.markdown(
         "**Missing from the export**  \n"
-        "Removed from the file, along with their cumulative hours. "
-        "Check the Dropped tab before downloading."
+        "Removed from the file, along with their cumulative hours."
     )
     st.markdown(
         "**Duplicate rows**  \n"
@@ -747,120 +1282,237 @@ with st.sidebar:
     with st.expander("Fields synced from the newest row"):
         st.write("\n".join(f"- {c}" for c in SYNC_FIELDS))
         st.caption(
-            "Because the newest row owns these, the weekly export no longer "
-            "updates them on older rows - see the Held back tab."
+            "Because the newest row owns these, the weekly export does not "
+            "update them on older rows."
         )
 
     st.markdown(
         "**Never changed**  \n"
         "Employee Full Name and Hire Date. Output is sorted by name."
     )
-
-col_a, col_b = st.columns(2)
-with col_a:
-    hist_file = st.file_uploader(
-        "Historical file (last week's roster)", type=["xlsx", "xlsm", "csv"], key="hist"
-    )
-with col_b:
-    new_file = st.file_uploader(
-        "This week's Employee Hours export", type=["csv", "xlsx", "xlsm"], key="new"
+    st.markdown(
+        "**Duplicate-week protection**  \n"
+        "The same exact file is ignored. A different file for an already stored "
+        "period requires your confirmation before replacement."
     )
 
-if not (hist_file and new_file):
-    st.info("Upload both files to continue.")
-    st.stop()
-
+# --- Connect / initialize Google Sheets --------------------------------------
 try:
-    hist_df, hist_meta = load_table_cached(hist_file.getvalue(), hist_file.name)
+    backend = initialize_google_backend()
 except Exception as exc:
-    st.error(f"Could not read the historical file: {exc}")
+    st.error(f"Could not initialize Google Sheets: {exc}")
     st.stop()
 
+historical_df = backend["historical_df"]
+
+st.success(
+    f"Google historical database connected — **{len(historical_df):,} rows** currently stored."
+)
+
+# The historical download is always available, even before a new weekly upload.
+st.subheader("Historical file")
+st.download_button(
+    "Download current historical file",
+    data=build_excel_cached(historical_df),
+    file_name="Employee_Hours_Historical_Current.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)
+
+st.divider()
+
+# --- Weekly upload ------------------------------------------------------------
+new_file = st.file_uploader(
+    "This week's Employee Hours export",
+    type=["csv", "xlsx", "xlsm"],
+    key="new_week_file",
+)
+
+if not new_file:
+    st.info("Upload this week's Employee Hours export when you're ready.")
+    st.stop()
+
+file_bytes = new_file.getvalue()
+file_hash = file_sha256(file_bytes)
+
 try:
-    new_df, new_meta = load_table_cached(new_file.getvalue(), new_file.name)
+    new_df, new_meta = load_table_cached(file_bytes, new_file.name)
 except Exception as exc:
     st.error(f"Could not read the weekly export: {exc}")
     st.stop()
 
-period = new_meta.get("Time Period", "")
-if period:
-    st.success(f"Weekly export period: **{period}**")
-
-merged = merge_cached(
-    hist_df, new_df,
-    drop_missing, link_rehire,
-    tuple(sync_fields), sync_temp_only,
-)
-out_df = merged["result"]
-
-if sort_output:
-    out_df = out_df.sort_values(
-        "Employee Full Name", key=lambda s: s.astype(str).str.upper()
-    ).reset_index(drop=True)
-
-# --- Results -----------------------------------------------------------------
-
-
-def count_people(log, was, now):
-    """Distinct people whose Employment Status moved from `was` to `now`.
-
-    Draws on both the weekly update and the duplicate sync, then de-duplicates
-    by name: one person with several rows that all flipped is still one person.
-    """
-    names = set()
-    for frame in log:
-        if not len(frame):
-            continue
-        if not {"Field", "Was", "Now"} <= set(frame.columns):
-            continue
-        hit = frame[
-            (frame["Field"] == "Employment Status")
-            & (frame["Was"] == was)
-            & (frame["Now"] == now)
-        ]
-        names |= {normalized_name(v) for v in hit["Employee Full Name"]}
-    names.discard("")
-    return len(names)
-
-
-terminated = count_people([merged["field_log"], merged["sync_log"]], "Active", "Terminated")
-reactivated = count_people([merged["field_log"], merged["sync_log"]], "Terminated", "Active")
-
-c1, c2 = st.columns(2)
-c1.metric("New hires added", f"{len(merged['new_hires']):,}")
-c2.metric("Active to Terminated", f"{terminated:,}")
-
-if reactivated:
-    st.caption(f"{reactivated:,} went the other way, Terminated to Active.")
-
-# Kept because these silently lose data if ignored.
-if len(merged["dropped"]):
-    lost = merged["dropped"]["Actual Hours"].sum(skipna=True)
-    names = ", ".join(merged["dropped"]["Employee Full Name"].astype(str).head(5))
-    st.warning(
-        f"{len(merged['dropped'])} removed for not appearing in the export, "
-        f"taking {lost:,.2f} cumulative hours: {names}"
-        + (" ..." if len(merged["dropped"]) > 5 else "")
-    )
-
-if len(merged["ambiguous"]):
+period = normalize_period_display(new_meta.get("Time Period", ""))
+if not period:
     st.error(
-        f"{len(merged['ambiguous'])} name(s) have several possible rehire matches "
-        "and were left alone. Resolve them in the historical file before re-running: "
-        + ", ".join(merged["ambiguous"]["Employee Full Name"].astype(str))
+        "This workflow requires the weekly export's **Time Period** metadata so the "
+        "app can prevent duplicate weeks and safely replace prior inputs."
+    )
+    st.stop()
+
+period_key = canonical_period_key(period)
+st.info(f"Weekly export period: **{period}**")
+
+log_df = read_update_log(backend["log_ws"])
+existing = find_log_row(log_df, period_key)
+
+processed_now = False
+replaced_now = False
+merged = None
+out_df = historical_df
+replay_ambiguous = pd.DataFrame()
+commit_record = None
+
+
+def remember_result(period, file_hash, out_df, merged, replay_ambiguous):
+    """Survive the rerun that a download-button click triggers."""
+    st.session_state["last_result"] = {
+        "period": period,
+        "hash": file_hash,
+        "out_df": out_df,
+        "merged": merged,
+        "replay_ambiguous": replay_ambiguous,
+    }
+
+
+if existing is None:
+    # NEW PERIOD: append straight onto Historical. No replay needed.
+    sequence = next_sequence(log_df)
+    try:
+        with st.spinner("Adding this week to Google Sheets..."):
+            out_df, merged, replay_ambiguous, commit_record = process_week_into_google(
+                backend, new_df, period, period_key, file_hash,
+                new_file.name, sequence, mode="append",
+            )
+        processed_now = True
+        remember_result(period, file_hash, out_df, merged, replay_ambiguous)
+        st.success(f"✅ **{period}** was added automatically to the historical database.")
+    except Exception as exc:
+        st.error(f"The week could not be committed to Google Sheets: {exc}")
+        st.stop()
+
+else:
+    existing_hash = str(existing.get("File Hash", ""))
+    existing_status = str(existing.get("Status", "")).upper()
+    sequence = int(pd.to_numeric(existing.get("Sequence", 0), errors="coerce") or 0)
+
+    if existing_hash == file_hash and existing_status == "COMMITTED":
+        st.warning(
+            f"⚠️ **{period} is already inputted.** This is the exact same file, "
+            "so no changes were made."
+        )
+        # Restore the results from the run that committed it, so they do not
+        # vanish when a download click reruns the script.
+        cached = st.session_state.get("last_result")
+        if cached and cached["hash"] == file_hash:
+            out_df = cached["out_df"]
+            merged = cached["merged"]
+            replay_ambiguous = cached["replay_ambiguous"]
+            processed_now = True
+
+    elif existing_hash == file_hash and existing_status != "COMMITTED":
+        # A previous attempt was interrupted. Replay rather than append: the
+        # interrupted run may have written a partial Historical, and appending
+        # onto that would double-count.
+        try:
+            with st.spinner("Finishing the previously interrupted update..."):
+                out_df, merged, replay_ambiguous, commit_record = process_week_into_google(
+                    backend, new_df, period, period_key, file_hash,
+                    new_file.name, sequence, mode="replay",
+                )
+            processed_now = True
+            remember_result(period, file_hash, out_df, merged, replay_ambiguous)
+            st.success(f"✅ **{period}** was completed successfully.")
+        except Exception as exc:
+            st.error(f"The interrupted week could not be completed: {exc}")
+            st.stop()
+
+    else:
+        st.warning(
+            f"⚠️ **{period} is already inputted, but this is a different file.**  \n\n"
+            "Do you want to replace your past input with the file you are uploading now? "
+            "If you replace it, the app will rebuild Historical from the Baseline and "
+            "replay every stored week in order."
+        )
+
+        replace_col, keep_col = st.columns(2)
+        with replace_col:
+            replace_clicked = st.button(
+                "Replace previous week with this file",
+                type="primary",
+                use_container_width=True,
+            )
+        with keep_col:
+            keep_clicked = st.button("Keep existing week", use_container_width=True)
+
+        if replace_clicked:
+            try:
+                with st.spinner("Replacing that week and rebuilding all later historical data..."):
+                    out_df, merged, replay_ambiguous, commit_record = process_week_into_google(
+                        backend, new_df, period, period_key, file_hash,
+                        new_file.name, sequence, mode="replay",
+                    )
+                replaced_now = True
+                remember_result(period, file_hash, out_df, merged, replay_ambiguous)
+                st.success(
+                    f"✅ **{period}** was replaced. Historical data was rebuilt from the "
+                    "stored Baseline and weekly archive."
+                )
+            except Exception as exc:
+                st.error(f"The prior week could not be replaced: {exc}")
+                st.stop()
+        elif keep_clicked:
+            st.info(f"No changes were made. The existing **{period}** input was kept.")
+
+# --- Results ------------------------------------------------------------------
+if merged is not None:
+    terminated = count_people(
+        [merged["field_log"], merged["sync_log"]], "Active", "Terminated"
+    )
+    reactivated = count_people(
+        [merged["field_log"], merged["sync_log"]], "Terminated", "Active"
     )
 
-# --- Download ----------------------------------------------------------------
-st.subheader("Download")
+    st.subheader("This week's results")
+    c1, c2 = st.columns(2)
+    c1.metric("New hires added", f"{len(merged['new_hires']):,}")
+    c2.metric("Active to Terminated", f"{terminated:,}")
 
-label = re.sub(r"[^0-9A-Za-z]+", "_", period).strip("_") if period else \
-    datetime.now().strftime("%Y_%m_%d")
-filename = f"Employee_Hours_Historical_{label}.xlsx"
+    if reactivated:
+        st.caption(f"{reactivated:,} went the other way, Terminated to Active.")
 
-if st.button("Prepare file for download", type="primary"):
-    st.session_state["excel_ready"] = True
+    # Kept because these silently lose data if ignored.
+    if len(merged["dropped"]):
+        lost = merged["dropped"]["Actual Hours"].sum(skipna=True)
+        names = ", ".join(merged["dropped"]["Employee Full Name"].astype(str).head(5))
+        st.warning(
+            f"{len(merged['dropped'])} removed for not appearing in the export, "
+            f"taking {lost:,.2f} cumulative hours: {names}"
+            + (" ..." if len(merged["dropped"]) > 5 else "")
+        )
 
-if st.session_state.get("excel_ready"):
+    if len(merged["ambiguous"]):
+        st.error(
+            f"{len(merged['ambiguous'])} name(s) have several possible rehire matches "
+            "and were left alone: "
+            + ", ".join(merged["ambiguous"]["Employee Full Name"].astype(str))
+        )
+
+    # Replacing an older week replays later weeks too. Surface any ambiguous
+    # matches found anywhere during that replay so none are silently hidden.
+    if replaced_now and len(replay_ambiguous):
+        later = replay_ambiguous[replay_ambiguous["Period"].astype(str) != period]
+        if len(later):
+            st.error(
+                "The rebuild found ambiguous rehire match(es) in later stored week(s). "
+                "Historical was rebuilt using the same existing rule (ambiguous matches "
+                "are left alone). Review these rows:"
+            )
+            st.dataframe(later, use_container_width=True, hide_index=True)
+
+# Always offer the freshest Historical after processing/replacement.
+if processed_now or replaced_now:
+    st.subheader("Updated historical file")
+    label = re.sub(r"[^0-9A-Za-z]+", "_", period).strip("_")
+    filename = f"Employee_Hours_Historical_{label}.xlsx"
     st.download_button(
         "Download updated historical file",
         data=build_excel_cached(out_df),
@@ -868,4 +1520,3 @@ if st.session_state.get("excel_ready"):
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
     )
-st.caption(f"`{filename}` — upload this as the historical file next week.")
