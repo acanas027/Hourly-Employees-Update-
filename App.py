@@ -111,6 +111,30 @@ def _normalize_header(name) -> str:
     return str(name).strip()
 
 
+def header_fingerprint(name) -> str:
+    """Case- and whitespace-insensitive form of a column name.
+
+    Column V is 'Absence  - Unplanned Hours - Unexcused' with a double space,
+    a quirk of the source export. Google Sheets collapses runs of whitespace on
+    some paste paths, so an exact-match lookup breaks on a header that is
+    visually identical. Matching on the fingerprint tolerates that in either
+    direction without letting Excused and Unexcused collide.
+    """
+    return re.sub(r"\s+", " ", str(name or "").strip()).upper()
+
+
+def resolve_headers(headers: list) -> list:
+    """Map raw sheet/file headers onto canonical names where they match."""
+    canonical_by_fp = {header_fingerprint(c): c for c in CANONICAL_COLUMNS}
+    alias_by_fp = {header_fingerprint(k): v for k, v in COLUMN_ALIASES.items()}
+
+    resolved = []
+    for raw in headers:
+        fp = header_fingerprint(raw)
+        resolved.append(alias_by_fp.get(fp) or canonical_by_fp.get(fp) or _normalize_header(raw))
+    return resolved
+
+
 def _find_header_row(raw: pd.DataFrame, sentinel: str = "Employment Status") -> int:
     """Locate the header row; weekly exports carry metadata lines above it."""
     for idx in range(min(40, len(raw))):
@@ -161,14 +185,14 @@ def load_table(uploaded_file) -> tuple[pd.DataFrame, dict]:
     header_row = _find_header_row(raw)
     metadata = _extract_metadata(raw, header_row)
 
-    headers = [_normalize_header(h) for h in raw.iloc[header_row].tolist()]
+    headers = resolve_headers(raw.iloc[header_row].tolist())
     df = raw.iloc[header_row + 1:].copy()
     df.columns = headers
     df = df.reset_index(drop=True)
 
     # Drop unnamed/helper trailing columns (the CONCATENATE and COUNTIF columns).
     df = df.loc[:, [c for c in df.columns if c != ""]]
-    df = df.rename(columns=COLUMN_ALIASES)
+    df = df.loc[:, ~df.columns.duplicated()]
 
     missing = [c for c in CANONICAL_COLUMNS if c not in df.columns]
     if missing:
@@ -753,8 +777,7 @@ def roster_from_sheet_values(values: list[list], source_name: str) -> pd.DataFra
     if not values:
         return pd.DataFrame(columns=CANONICAL_COLUMNS)
 
-    headers = [_normalize_header(h) for h in values[0]]
-    headers = [COLUMN_ALIASES.get(h, h) for h in headers]
+    headers = resolve_headers(values[0])
 
     missing = [c for c in CANONICAL_COLUMNS if c not in headers]
     if missing:
@@ -767,6 +790,7 @@ def roster_from_sheet_values(values: list[list], source_name: str) -> pd.DataFra
     width = len(headers)
     padded = [r + [""] * (width - len(r)) for r in rows]
     df = pd.DataFrame(padded, columns=headers)
+    df = df.loc[:, ~df.columns.duplicated()]
     df = df[CANONICAL_COLUMNS].copy()
     df = df.replace("", pd.NA)
 
@@ -839,8 +863,8 @@ def ensure_sheet_header(ws, header: list[str]):
         ws.update([header], "A1", raw=True)
         return
 
-    normalized = [_normalize_header(v) for v in first_row[:len(header)]]
-    if normalized != header:
+    normalized = [header_fingerprint(v) for v in first_row[:len(header)]]
+    if normalized != [header_fingerprint(h) for h in header]:
         raise ValueError(
             f"Google Sheet tab '{ws.title}' has an unexpected header. "
             "Do not rename/reorder its system columns."
@@ -1225,9 +1249,9 @@ def build_excel_cached(df):
 # UI
 # ----------------------------------------------------------------------------
 
-st.set_page_config(page_title="Employee Hours Roster Updater", page_icon="📋", layout="wide")
+st.set_page_config(page_title="Employee Hours Roster", page_icon="", layout="wide")
 
-st.title("Employee Hours Roster Updater")
+st.title("Employee Hours Roster")
 st.caption(
     "Upload only this week's Employee Hours export. The cumulative historical "
     "roster is stored and updated automatically in Google Sheets. Employees are "
