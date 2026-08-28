@@ -307,6 +307,19 @@ def normalized_name(value) -> str:
     return re.sub(r"\s+", " ", str(value).strip()).upper()
 
 
+def is_day_month_swap(a, b) -> bool:
+    """True when two dates are the same numbers with day and month exchanged.
+
+    5/3/2018 vs 3/5/2018. Google Sheets produces these in bulk when the
+    spreadsheet locale is not United States, and the damage is invisible: the
+    dates still look plausible and the rehire logic quietly absorbs them.
+    """
+    a, b = pd.to_datetime(a, errors="coerce"), pd.to_datetime(b, errors="coerce")
+    if pd.isna(a) or pd.isna(b) or a == b:
+        return False
+    return a.year == b.year and a.day == b.month and a.month == b.day
+
+
 def link_rehires(hist, new, dropped_keys, new_hire_keys):
     """Reconnect employees whose Hire Date was rewritten between exports.
 
@@ -547,6 +560,7 @@ def merge_rosters(hist: pd.DataFrame, new: pd.DataFrame, drop_missing: bool,
     # hire. Relink them so their cumulative hours survive.
     rehire_log, ambiguous = [], []
     rehire_rows = {}
+    date_swaps = 0
 
     if link_rehire:
         pairs, ambiguous = link_rehires(hist, new, dropped_keys, new_hire_keys)
@@ -562,6 +576,9 @@ def merge_rosters(hist: pd.DataFrame, new: pd.DataFrame, drop_missing: bool,
                 else:
                     merged_row[col] = (0 if pd.isna(old_v) else float(old_v)) + \
                                       (0 if pd.isna(new_v) else float(new_v))
+
+            if is_day_month_swap(h_row["Hire Date"], n_row["Hire Date"]):
+                date_swaps += 1
 
             rehire_rows[fresh_key] = merged_row
             rehire_log.append({
@@ -617,6 +634,7 @@ def merge_rosters(hist: pd.DataFrame, new: pd.DataFrame, drop_missing: bool,
         "hours_log": pd.DataFrame(hours_log),
         "field_log": pd.DataFrame(field_log),
         "rehire_log": pd.DataFrame(rehire_log),
+        "date_swaps": date_swaps,
         "sync_log": sync_log,
         "deferred_log": pd.DataFrame(deferred_log),
         "sync_groups": sync_groups,
@@ -770,6 +788,26 @@ def dataframe_to_sheet_rows(df: pd.DataFrame, columns: list) -> list[list]:
     for _, row in df.iterrows():
         rows.append([_sheet_cell_value(row.get(col, ""), col) for col in columns])
     return rows
+
+
+def has_canonical_header(values: list) -> bool:
+    """True when row 0 resolves to every canonical column."""
+    if not values:
+        return False
+    headers = resolve_headers(values[0])
+    return all(c in headers for c in CANONICAL_COLUMNS)
+
+
+def read_managed_roster(values: list, source_name: str) -> pd.DataFrame:
+    """Read an app-managed tab, treating an unusable one as empty.
+
+    Baseline is created by the app before it is written to, so a run that fails
+    partway leaves a tab that exists with no header. That is a tab needing to be
+    seeded, not a fatal error, and erroring on it strands the app permanently.
+    """
+    if not has_canonical_header(values):
+        return pd.DataFrame(columns=CANONICAL_COLUMNS)
+    return roster_from_sheet_values(values, source_name)
 
 
 def roster_from_sheet_values(values: list[list], source_name: str) -> pd.DataFrame:
@@ -1108,15 +1146,16 @@ def initialize_google_backend():
     historical_values = fetch_tab_values(HISTORICAL_SHEET, v)
     baseline_values = fetch_tab_values(BASELINE_SHEET, v)
 
-    # Historical/Baseline are allowed to be brand-new blank tabs.
+    # Historical holds your data, so a malformed header there is a real error
+    # worth stopping on rather than silently ignoring.
     historical_df = (
         roster_from_sheet_values(historical_values, HISTORICAL_SHEET)
         if historical_values else pd.DataFrame(columns=CANONICAL_COLUMNS)
     )
-    baseline_df = (
-        roster_from_sheet_values(baseline_values, BASELINE_SHEET)
-        if baseline_values else pd.DataFrame(columns=CANONICAL_COLUMNS)
-    )
+
+    # Baseline is written by the app and can always be re-seeded from
+    # Historical, so a blank or half-created tab is just one to fill in.
+    baseline_df = read_managed_roster(baseline_values, BASELINE_SHEET)
 
     if baseline_df.empty:
         if historical_df.empty:
@@ -1249,7 +1288,7 @@ def build_excel_cached(df):
 # UI
 # ----------------------------------------------------------------------------
 
-st.set_page_config(page_title="Employee Hours Roster Updater", page_icon="", layout="wide")
+st.set_page_config(page_title="Employee Hours Roster Updater", page_icon="📋", layout="wide")
 
 st.title("Employee Hours Roster Updater")
 st.caption(
@@ -1494,6 +1533,17 @@ if merged is not None:
     reactivated = count_people(
         [merged["field_log"], merged["sync_log"]], "Terminated", "Active"
     )
+
+    swaps = merged.get("date_swaps", 0)
+    if swaps >= 5:
+        st.error(
+            f"**Stop - {swaps} hire dates look day/month swapped.** These were "
+            "counted as rehires, but they are almost certainly the same people "
+            "with corrupted dates (5/3/2018 stored as 3/5/2018). This happens "
+            "when the Google Sheet locale is not United States. Fix it under "
+            "File > Settings > Locale, re-import the Historical tab, and run "
+            "this week again before trusting the result."
+        )
 
     st.subheader("This week's results")
     c1, c2 = st.columns(2)
