@@ -134,6 +134,38 @@ def resolve_headers(headers: list) -> list:
         resolved.append(alias_by_fp.get(fp) or canonical_by_fp.get(fp) or _normalize_header(raw))
     return resolved
 
+def parse_hours_series(series: pd.Series) -> pd.Series:
+    """
+    Convert formatted hour values from Google Sheets, CSV, and Excel into
+    actual numeric values.
+
+    Examples:
+        "3,267.66"  -> 3267.66
+        "$1,250.00" -> 1250.00
+        "(40.00)"   -> -40.00
+        ""          -> NaN
+        None        -> NaN
+    """
+    text = series.astype("string").str.strip()
+
+    # Detect accounting-style negative numbers before removing parentheses.
+    negative_mask = text.str.match(r"^\(.*\)$", na=False)
+
+    text = (
+        text
+        .str.replace(",", "", regex=False)
+        .str.replace("$", "", regex=False)
+        .str.replace("(", "", regex=False)
+        .str.replace(")", "", regex=False)
+        .str.strip()
+    )
+
+    result = pd.to_numeric(text, errors="coerce")
+
+    # Restore negatives represented with parentheses.
+    result.loc[negative_mask] = -result.loc[negative_mask].abs()
+
+    return result
 
 def _find_header_row(raw: pd.DataFrame, sentinel: str = "Employment Status") -> int:
     """Locate the header row; weekly exports carry metadata lines above it."""
@@ -207,7 +239,7 @@ def load_table(uploaded_file) -> tuple[pd.DataFrame, dict]:
     df = df[~blank].reset_index(drop=True)
 
     for col in HOURS_COLUMNS:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df[col] = parse_hours_series(df[col])
     for col in DATE_COLUMNS:
         df[col] = pd.to_datetime(df[col], errors="coerce")
 
@@ -862,7 +894,7 @@ def roster_from_sheet_values(values: list[list], source_name: str) -> pd.DataFra
     df = df[~blank].reset_index(drop=True)
 
     for col in HOURS_COLUMNS:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df[col] = parse_hours_series(df[col])
     for col in DATE_COLUMNS:
         df[col] = pd.to_datetime(df[col], errors="coerce")
 
@@ -1075,7 +1107,7 @@ def weekly_groups_from_archive(ws) -> list[dict]:
 
         week = block[CANONICAL_COLUMNS].copy().replace("", pd.NA)
         for col in HOURS_COLUMNS:
-            week[col] = pd.to_numeric(week[col], errors="coerce")
+    week[col] = parse_hours_series(week[col])
         for col in DATE_COLUMNS:
             week[col] = pd.to_datetime(week[col], errors="coerce")
 
