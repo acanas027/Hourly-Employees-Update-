@@ -1107,7 +1107,7 @@ def weekly_groups_from_archive(ws) -> list[dict]:
 
         week = block[CANONICAL_COLUMNS].copy().replace("", pd.NA)
         for col in HOURS_COLUMNS:
-    week[col] = parse_hours_series(week[col])
+            week[col] = parse_hours_series(week[col])
         for col in DATE_COLUMNS:
             week[col] = pd.to_datetime(week[col], errors="coerce")
 
