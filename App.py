@@ -894,7 +894,7 @@ def roster_from_sheet_values(values: list[list], source_name: str) -> pd.DataFra
     df = df[~blank].reset_index(drop=True)
 
     for col in HOURS_COLUMNS:
-    df[col] = parse_hours_series(df[col])
+        df[col] = parse_hours_series(df[col])
     for col in DATE_COLUMNS:
         df[col] = pd.to_datetime(df[col], errors="coerce")
 
