@@ -1059,21 +1059,35 @@ def _contiguous_blocks(row_numbers: list[int]) -> list[tuple[int, int]]:
     return blocks
 
 
+def _write_block(ws, rows: list, start_row: int, chunk: int = 500):
+    """Write rows at explicit cell ranges, in chunks.
+
+    append_rows() uses Google's values.append endpoint, which searches for a
+    "table" near A1 and decides for itself where the data goes. That heuristic
+    can return success having written nothing. Naming the exact range removes
+    the guesswork, and chunking keeps each request small enough to accept.
+    """
+    last_col = get_column_letter(len(WEEKLY_STORAGE_COLUMNS))
+    for i in range(0, len(rows), chunk):
+        block = rows[i:i + chunk]
+        r0 = start_row + i
+        r1 = r0 + len(block) - 1
+        ws.update(block, f"A{r0}:{last_col}{r1}", raw=True)
+
+
 def archive_weekly_period(ws, new_df: pd.DataFrame, period_key: str, period: str,
                           sequence: int, file_hash: str, filename: str):
-    """Replace this period's archived rows in-place, or append it if it is new."""
+    """Replace this period's archived rows, then append them at the end.
+
+    Physical row order does not matter: weekly_groups_from_archive sorts by
+    __Sequence. So there is no need to splice rows back into their old position,
+    which lets this use plain range writes instead of insert_rows.
+    """
     existing = ws.get_all_values()
     rows_for_period = [
         i for i, row in enumerate(existing[1:], start=2)
         if row and str(row[0]) == period_key
     ]
-    insert_at = min(rows_for_period) if rows_for_period else None
-
-    # The tab is created with 5,000 rows. Three weeks of exports exceed that,
-    # and a write past the grid edge fails silently on the append path.
-    needed = len(existing) + len(new_df) + 100
-    if ws.row_count < needed:
-        ws.resize(rows=needed, cols=max(ws.col_count, len(WEEKLY_STORAGE_COLUMNS)))
 
     # Delete bottom-up so row numbers above each deleted block remain valid.
     for start, end in reversed(_contiguous_blocks(rows_for_period)):
@@ -1088,28 +1102,30 @@ def archive_weekly_period(ws, new_df: pd.DataFrame, period_key: str, period: str
     if not archive_rows:
         raise ValueError("The weekly export contains no employee rows to archive.")
 
-    if insert_at is None:
-        ws.append_rows(archive_rows, value_input_option="RAW")
-    else:
-        ws.insert_rows(
-            archive_rows,
-            row=insert_at,
-            value_input_option="RAW",
-            inherit_from_before=(insert_at > 1),
-        )
+    # Re-read after the deletes so the start row is accurate.
+    current = ws.get_all_values()
+    start_row = len(current) + 1
+
+    # The tab is created with 5,000 rows. Three weeks of exports exceed that,
+    # and a write past the grid edge cannot land.
+    needed = start_row + len(archive_rows) + 100
+    if ws.row_count < needed:
+        ws.resize(rows=needed, cols=max(ws.col_count, len(WEEKLY_STORAGE_COLUMNS)))
+
+    _write_block(ws, archive_rows, start_row)
 
     # Read the rows back. Append mode never reads the archive again, so without
     # this a failed write looks like a successful week and only surfaces months
     # later when a replay finds nothing. This runs before Historical is touched,
     # so a bad archive aborts the whole week instead of half-completing it.
-    written = [
-        r for r in ws.get_all_values()[1:]
-        if r and str(r[0]) == period_key
-    ]
+    after = ws.get_all_values()
+    written = [r for r in after[1:] if r and str(r[0]) == period_key]
     if len(written) != len(archive_rows):
         raise RuntimeError(
             f"Archive write did not land: expected {len(archive_rows)} rows for "
-            f"{period_key}, found {len(written)}. Nothing was committed."
+            f"{period_key}, found {len(written)}. Wrote from row {start_row}; "
+            f"tab now has {len(after)} rows and a grid of {ws.row_count}. "
+            "Nothing was committed."
         )
 
 
