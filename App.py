@@ -165,7 +165,13 @@ def parse_hours_series(series: pd.Series) -> pd.Series:
     # Restore negatives represented with parentheses.
     result.loc[negative_mask] = -result.loc[negative_mask].abs()
 
-    return result
+    # to_numeric on a string column returns a pandas *nullable* dtype (Int64 /
+    # Float64). merge_rosters assigns a whole frame of hours into .loc[...] on a
+    # string-indexed DataFrame, and pandas takes an integer-coercion path there
+    # that indexes positionally, raising KeyError. Plain float64 avoids it and
+    # still keeps blanks as NaN.
+    return result.astype("float64")
+
 
 def _find_header_row(raw: pd.DataFrame, sentinel: str = "Employment Status") -> int:
     """Locate the header row; weekly exports carry metadata lines above it."""
@@ -728,6 +734,7 @@ def to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Employee Hours Test") ->
     wb.save(buf)
     return buf.getvalue()
 
+
 def sheet_to_excel_bytes(ws) -> bytes:
     """
     Export the worksheet exactly as it exists in Google Sheets.
@@ -752,7 +759,6 @@ def sheet_to_excel_bytes(ws) -> bytes:
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
-
 
 
 # ----------------------------------------------------------------------------
@@ -1063,6 +1069,12 @@ def archive_weekly_period(ws, new_df: pd.DataFrame, period_key: str, period: str
     ]
     insert_at = min(rows_for_period) if rows_for_period else None
 
+    # The tab is created with 5,000 rows. Three weeks of exports exceed that,
+    # and a write past the grid edge fails silently on the append path.
+    needed = len(existing) + len(new_df) + 100
+    if ws.row_count < needed:
+        ws.resize(rows=needed, cols=max(ws.col_count, len(WEEKLY_STORAGE_COLUMNS)))
+
     # Delete bottom-up so row numbers above each deleted block remain valid.
     for start, end in reversed(_contiguous_blocks(rows_for_period)):
         ws.delete_rows(start, end)
@@ -1084,6 +1096,20 @@ def archive_weekly_period(ws, new_df: pd.DataFrame, period_key: str, period: str
             row=insert_at,
             value_input_option="RAW",
             inherit_from_before=(insert_at > 1),
+        )
+
+    # Read the rows back. Append mode never reads the archive again, so without
+    # this a failed write looks like a successful week and only surfaces months
+    # later when a replay finds nothing. This runs before Historical is touched,
+    # so a bad archive aborts the whole week instead of half-completing it.
+    written = [
+        r for r in ws.get_all_values()[1:]
+        if r and str(r[0]) == period_key
+    ]
+    if len(written) != len(archive_rows):
+        raise RuntimeError(
+            f"Archive write did not land: expected {len(archive_rows)} rows for "
+            f"{period_key}, found {len(written)}. Nothing was committed."
         )
 
 
@@ -1448,7 +1474,6 @@ st.success(
 
 # The historical download is always available, even before a new weekly upload.
 st.subheader("Historical file")
-
 fresh_ws = backend["book"].worksheet(HISTORICAL_SHEET)
 
 st.download_button(
@@ -1532,7 +1557,8 @@ if existing is None:
 else:
     existing_hash = str(existing.get("File Hash", ""))
     existing_status = str(existing.get("Status", "")).upper()
-    sequence = int(pd.to_numeric(existing.get("Sequence", 0), errors="coerce") or 0)
+    seq_val = pd.to_numeric(existing.get("Sequence", 0), errors="coerce")
+    sequence = 0 if pd.isna(seq_val) else int(seq_val)
 
     if existing_hash == file_hash and existing_status == "COMMITTED":
         st.warning(
