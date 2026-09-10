@@ -16,6 +16,7 @@ import csv
 import hashlib
 import io
 import re
+import time
 from datetime import datetime, timezone
 
 import gspread
@@ -524,6 +525,14 @@ def merge_rosters(hist: pd.DataFrame, new: pd.DataFrame, drop_missing: bool,
     )
 
     result = hist.copy()
+
+    # Attribute columns are written cell by cell below. If pandas inferred a
+    # numeric dtype for one (Department read as int64, say) then assigning the
+    # export's string value raises. Object dtype accepts either.
+    for col in ATTRIBUTE_COLUMNS:
+        if result[col].dtype != object:
+            result[col] = result[col].astype(object)
+
     hours_log, field_log, deferred_log = [], [], []
 
     if matched:
@@ -750,7 +759,7 @@ def sheet_to_excel_bytes(ws) -> bytes:
     excel_ws = wb.active
     excel_ws.title = ws.title
 
-    values = ws.get_all_values()
+    values = api_call(ws.get_all_values)
 
     for r, row in enumerate(values, start=1):
         for c, value in enumerate(row, start=1):
@@ -907,6 +916,26 @@ def roster_from_sheet_values(values: list[list], source_name: str) -> pd.DataFra
     return df
 
 
+def api_call(fn, *args, **kwargs):
+    """Run a Google Sheets call, waiting out quota errors.
+
+    Google allows 60 reads and 60 writes per minute per user. A single upload
+    makes dozens of calls, so a busy run can trip the limit and return 429
+    RESOURCE_EXHAUSTED. The quota is per minute, so waiting clears it.
+    """
+    delay = 10
+    for attempt in range(6):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            text = str(exc)
+            quota = "429" in text or "RESOURCE_EXHAUSTED" in text or "RATE_LIMIT" in text
+            if not quota or attempt == 5:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 70)
+
+
 @st.cache_resource(show_spinner=False)
 def get_google_spreadsheet():
     """Authenticate with a service account stored in Streamlit secrets."""
@@ -961,24 +990,28 @@ def fetch_tab_values(title: str, version: int) -> list[list]:
     """Read one tab. `version` is part of the cache key, not used in the body."""
     book = get_google_spreadsheet()
     try:
-        return book.worksheet(title).get_all_values()
+        return api_call(book.worksheet(title).get_all_values)
     except gspread.WorksheetNotFound:
         return []
 
 
-def get_or_create_worksheet(book, title: str, rows: int, cols: int):
+def get_or_create_worksheet(book, title: str, rows: int, cols: int, known=None):
+    """Fetch or create a tab. `known` is a title -> worksheet map from one
+    metadata read, so four lookups do not cost four reads."""
+    if known is not None and title in known:
+        return known[title]
     try:
-        return book.worksheet(title)
+        return api_call(book.worksheet, title)
     except gspread.WorksheetNotFound:
         return book.add_worksheet(title=title, rows=rows, cols=cols)
 
 
 def ensure_sheet_header(ws, header: list[str]):
-    first_row = ws.row_values(1)
+    first_row = api_call(ws.row_values, 1)
     if not first_row:
         if ws.col_count < len(header):
             ws.resize(cols=len(header))
-        ws.update([header], "A1", raw=True)
+        api_call(ws.update, [header], "A1", raw=True)
         return
 
     normalized = [header_fingerprint(v) for v in first_row[:len(header)]]
@@ -999,13 +1032,13 @@ def write_roster_worksheet(ws, df: pd.DataFrame):
     needed_cols = max(26, len(CANONICAL_COLUMNS))
     if ws.row_count < needed_rows or ws.col_count < needed_cols:
         ws.resize(rows=max(ws.row_count, needed_rows), cols=max(ws.col_count, needed_cols))
-    ws.clear()
-    ws.update(values, "A1", raw=True)
-    ws.freeze(rows=1)
+    api_call(ws.clear)
+    api_call(ws.update, values, "A1", raw=True)
+    api_call(ws.freeze, rows=1)
 
 
 def read_update_log(ws) -> pd.DataFrame:
-    values = ws.get_all_values()
+    values = api_call(ws.get_all_values)
     if len(values) <= 1:
         return pd.DataFrame(columns=LOG_COLUMNS)
     width = len(LOG_COLUMNS)
@@ -1028,7 +1061,7 @@ def next_sequence(log_df: pd.DataFrame) -> int:
 
 
 def upsert_log_row(ws, record: dict):
-    values = ws.get_all_values()
+    values = api_call(ws.get_all_values)
     row_number = None
     for i, row in enumerate(values[1:], start=2):
         if row and str(row[0]) == str(record["Period Key"]):
@@ -1038,9 +1071,9 @@ def upsert_log_row(ws, record: dict):
     row_values = [_sheet_cell_value(record.get(col, "")) for col in LOG_COLUMNS]
     last_col = get_column_letter(len(LOG_COLUMNS))
     if row_number is None:
-        ws.append_row(row_values, value_input_option="RAW")
+        api_call(ws.append_row, row_values, value_input_option="RAW")
     else:
-        ws.update([row_values], f"A{row_number}:{last_col}{row_number}", raw=True)
+        api_call(ws.update, [row_values], f"A{row_number}:{last_col}{row_number}", raw=True)
 
 
 def _contiguous_blocks(row_numbers: list[int]) -> list[tuple[int, int]]:
@@ -1072,7 +1105,7 @@ def _write_block(ws, rows: list, start_row: int, chunk: int = 500):
         block = rows[i:i + chunk]
         r0 = start_row + i
         r1 = r0 + len(block) - 1
-        ws.update(block, f"A{r0}:{last_col}{r1}", raw=True)
+        api_call(ws.update, block, f"A{r0}:{last_col}{r1}", raw=True)
 
 
 def archive_weekly_period(ws, new_df: pd.DataFrame, period_key: str, period: str,
@@ -1083,7 +1116,7 @@ def archive_weekly_period(ws, new_df: pd.DataFrame, period_key: str, period: str
     __Sequence. So there is no need to splice rows back into their old position,
     which lets this use plain range writes instead of insert_rows.
     """
-    existing = ws.get_all_values()
+    existing = api_call(ws.get_all_values)
     rows_for_period = [
         i for i, row in enumerate(existing[1:], start=2)
         if row and str(row[0]) == period_key
@@ -1102,9 +1135,9 @@ def archive_weekly_period(ws, new_df: pd.DataFrame, period_key: str, period: str
     if not archive_rows:
         raise ValueError("The weekly export contains no employee rows to archive.")
 
-    # Re-read after the deletes so the start row is accurate.
-    current = ws.get_all_values()
-    start_row = len(current) + 1
+    # We know what the deletes removed, so compute the start row instead of
+    # spending another read on it.
+    start_row = len(existing) - len(rows_for_period) + 1
 
     # The tab is created with 5,000 rows. Three weeks of exports exceed that,
     # and a write past the grid edge cannot land.
@@ -1118,7 +1151,7 @@ def archive_weekly_period(ws, new_df: pd.DataFrame, period_key: str, period: str
     # this a failed write looks like a successful week and only surfaces months
     # later when a replay finds nothing. This runs before Historical is touched,
     # so a bad archive aborts the whole week instead of half-completing it.
-    after = ws.get_all_values()
+    after = api_call(ws.get_all_values)
     written = [r for r in after[1:] if r and str(r[0]) == period_key]
     if len(written) != len(archive_rows):
         raise RuntimeError(
@@ -1130,7 +1163,7 @@ def archive_weekly_period(ws, new_df: pd.DataFrame, period_key: str, period: str
 
 
 def weekly_groups_from_archive(ws) -> list[dict]:
-    values = ws.get_all_values()
+    values = api_call(ws.get_all_values)
     if len(values) <= 1:
         return []
 
@@ -1248,15 +1281,25 @@ def merge_summary(merged: dict, weekly_df: pd.DataFrame) -> dict:
 def initialize_google_backend():
     """Create system tabs and snapshot Historical -> Baseline exactly once."""
     book = get_google_spreadsheet()
-    historical_ws = get_or_create_worksheet(book, HISTORICAL_SHEET, rows=5000, cols=26)
-    baseline_ws = get_or_create_worksheet(book, BASELINE_SHEET, rows=5000, cols=26)
-    weekly_ws = get_or_create_worksheet(
-        book, WEEKLY_DATA_SHEET, rows=5000, cols=len(WEEKLY_STORAGE_COLUMNS)
-    )
-    log_ws = get_or_create_worksheet(book, UPDATE_LOG_SHEET, rows=500, cols=len(LOG_COLUMNS))
 
-    ensure_sheet_header(weekly_ws, WEEKLY_STORAGE_COLUMNS)
-    ensure_sheet_header(log_ws, LOG_COLUMNS)
+    # One metadata read gives every tab handle, instead of one read per tab.
+    known = {w.title: w for w in api_call(book.worksheets)}
+
+    historical_ws = get_or_create_worksheet(book, HISTORICAL_SHEET, rows=5000, cols=26, known=known)
+    baseline_ws = get_or_create_worksheet(book, BASELINE_SHEET, rows=5000, cols=26, known=known)
+    weekly_ws = get_or_create_worksheet(
+        book, WEEKLY_DATA_SHEET, rows=5000, cols=len(WEEKLY_STORAGE_COLUMNS), known=known
+    )
+    log_ws = get_or_create_worksheet(book, UPDATE_LOG_SHEET, rows=500, cols=len(LOG_COLUMNS), known=known)
+
+    # Headers only need checking on tabs this process has not seen before.
+    checked = _cache_state().setdefault("headers_checked", set())
+    if WEEKLY_DATA_SHEET not in checked:
+        ensure_sheet_header(weekly_ws, WEEKLY_STORAGE_COLUMNS)
+        checked.add(WEEKLY_DATA_SHEET)
+    if UPDATE_LOG_SHEET not in checked:
+        ensure_sheet_header(log_ws, LOG_COLUMNS)
+        checked.add(UPDATE_LOG_SHEET)
 
     v = sheet_version()
     historical_values = fetch_tab_values(HISTORICAL_SHEET, v)
@@ -1490,21 +1533,18 @@ st.success(
 
 # The historical download is always available, even before a new weekly upload.
 st.subheader("Historical file")
-fresh_ws = backend["book"].worksheet(HISTORICAL_SHEET)
+# Built only when asked. Reading the whole tab on every rerun was costing two
+# read requests a click against Google's 60-per-minute quota.
+if st.button("Prepare historical file"):
+    st.session_state["hist_ready"] = True
 
-archive_rows_now = len(backend["weekly_ws"].get_all_values()) - 1
-archive_periods = len(weekly_groups_from_archive(backend["weekly_ws"]))
-st.caption(
-    f"Weekly_Data now holds {archive_rows_now:,} archived rows "
-    f"across {archive_periods} period(s)."
-)
-
-st.download_button(
-    "Download current historical file",
-    data=sheet_to_excel_bytes(fresh_ws),
-    file_name="Employee_Hours_Historical_Current.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-)
+if st.session_state.get("hist_ready"):
+    st.download_button(
+        "Download current historical file",
+        data=sheet_to_excel_bytes(backend["historical_ws"]),
+        file_name="Employee_Hours_Historical_Current.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 st.divider()
 
