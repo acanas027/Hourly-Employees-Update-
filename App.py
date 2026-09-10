@@ -1135,9 +1135,18 @@ def archive_weekly_period(ws, new_df: pd.DataFrame, period_key: str, period: str
     if not archive_rows:
         raise ValueError("The weekly export contains no employee rows to archive.")
 
-    # We know what the deletes removed, so compute the start row instead of
-    # spending another read on it.
-    start_row = len(existing) - len(rows_for_period) + 1
+    # get_all_values() returns every row in the GRID, including trailing blanks,
+    # so len() is the grid height rather than the number of populated rows. Once
+    # resize() grows the grid, writing at len()+1 lands far below the data and
+    # each run pushes the next one further down. Find the last row that actually
+    # holds a period key instead. Re-read first: the deletes shifted rows up.
+    if rows_for_period:
+        existing = api_call(ws.get_all_values)
+    populated = [
+        i for i, row in enumerate(existing[1:], start=2)
+        if row and str(row[0]).strip()
+    ]
+    start_row = (max(populated) if populated else 1) + 1
 
     # The tab is created with 5,000 rows. Three weeks of exports exceed that,
     # and a write past the grid edge cannot land.
@@ -1154,11 +1163,12 @@ def archive_weekly_period(ws, new_df: pd.DataFrame, period_key: str, period: str
     after = api_call(ws.get_all_values)
     written = [r for r in after[1:] if r and str(r[0]) == period_key]
     if len(written) != len(archive_rows):
+        rows_with_data = sum(1 for r in after[1:] if r and str(r[0]).strip())
         raise RuntimeError(
             f"Archive write did not land: expected {len(archive_rows)} rows for "
             f"{period_key}, found {len(written)}. Wrote from row {start_row}; "
-            f"tab now has {len(after)} rows and a grid of {ws.row_count}. "
-            "Nothing was committed."
+            f"tab holds {rows_with_data} populated rows in a grid of "
+            f"{ws.row_count}. Nothing was committed."
         )
 
 
