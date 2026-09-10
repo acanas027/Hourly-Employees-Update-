@@ -1492,6 +1492,13 @@ st.success(
 st.subheader("Historical file")
 fresh_ws = backend["book"].worksheet(HISTORICAL_SHEET)
 
+archive_rows_now = len(backend["weekly_ws"].get_all_values()) - 1
+archive_periods = len(weekly_groups_from_archive(backend["weekly_ws"]))
+st.caption(
+    f"Weekly_Data now holds {archive_rows_now:,} archived rows "
+    f"across {archive_periods} period(s)."
+)
+
 st.download_button(
     "Download current historical file",
     data=sheet_to_excel_bytes(fresh_ws),
