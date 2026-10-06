@@ -698,6 +698,47 @@ def merge_rosters(hist: pd.DataFrame, new: pd.DataFrame, drop_missing: bool,
 # Excel output
 # ----------------------------------------------------------------------------
 
+_NUMERIC_TEXT = re.compile(r"^-?\d{1,3}(,\d{3})*(\.\d+)?$|^-?\d+(\.\d+)?$")
+
+
+def excel_value(value, column):
+    """Return (cell value, number format) for one Excel cell.
+
+    Values arriving from Google Sheets are strings, so codes like Department
+    304 and Profit Center 400020 land in Excel as text. Anything that is
+    entirely numeric is written as a real number instead, which is what lets
+    Excel sum, sort and filter it. Leading-zero codes would be damaged by this,
+    so the check requires the text to round-trip: "0304" is left as text.
+    """
+    if pd.isna(value):
+        return None, None
+
+    if column in DATE_COLUMNS:
+        dt = pd.to_datetime(value, errors="coerce")
+        return (None, None) if pd.isna(dt) else (dt.to_pydatetime(), "m/d/yy")
+
+    if column in HOURS_COLUMNS:
+        num = pd.to_numeric(value, errors="coerce")
+        return (None, None) if pd.isna(num) else (float(num), "#,##0.00")
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return (int(value) if float(value).is_integer() else float(value)), "General"
+
+    text = str(value).strip()
+    if not text or not _NUMERIC_TEXT.match(text):
+        return (text or None), None
+
+    bare = text.replace(",", "")
+    # A leading zero carries meaning in a code, and converting would drop it.
+    if bare.lstrip("-").startswith("0") and bare.lstrip("-") not in ("0",) and "." not in bare:
+        return text, None
+
+    num = float(bare)
+    if num.is_integer() and "." not in bare:
+        return int(num), "General"
+    return num, "0.00"
+
+
 def to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Employee Hours Test") -> bytes:
     wb = Workbook()
     ws = wb.active
@@ -712,17 +753,11 @@ def to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Employee Hours Test") ->
 
     for r, (_, row) in enumerate(df.iterrows(), start=2):
         for c, col in enumerate(CANONICAL_COLUMNS, start=1):
-            value = row[col]
-            if pd.isna(value):
-                value = None
-            elif isinstance(value, pd.Timestamp):
-                value = value.to_pydatetime()
+            value, fmt = excel_value(row[col], col)
             cell = ws.cell(row=r, column=c, value=value)
             cell.font = body_font
-            if col in DATE_COLUMNS:
-                cell.number_format = "m/d/yyyy"
-            elif col in HOURS_COLUMNS:
-                cell.number_format = "#,##0.00"
+            if fmt:
+                cell.number_format = fmt
 
         refs = ",".join(f"{letter}{r}" for letter in HELPER_KEY_SOURCE_COLS)
         helper = ws.cell(row=r, column=HELPER_KEY_COL_INDEX, value=f"=CONCATENATE({refs})")
