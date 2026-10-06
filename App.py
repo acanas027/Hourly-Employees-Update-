@@ -779,32 +779,6 @@ def to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Employee Hours Test") ->
     return buf.getvalue()
 
 
-def sheet_to_excel_bytes(ws) -> bytes:
-    """
-    Export the worksheet exactly as it exists in Google Sheets.
-
-    No pandas conversion.
-    No date parsing.
-    No numeric conversion.
-    No column filtering.
-
-    Every visible cell from Google Sheets is written directly into Excel.
-    """
-    wb = Workbook()
-    excel_ws = wb.active
-    excel_ws.title = ws.title
-
-    values = api_call(ws.get_all_values)
-
-    for r, row in enumerate(values, start=1):
-        for c, value in enumerate(row, start=1):
-            excel_ws.cell(row=r, column=c, value=value)
-
-    buf = io.BytesIO()
-    wb.save(buf)
-    return buf.getvalue()
-
-
 # ----------------------------------------------------------------------------
 # Google Sheets persistence
 # ----------------------------------------------------------------------------
@@ -1112,7 +1086,7 @@ st.success(f"Connected — **{len(historical_df):,} rows** in the roster.")
 with st.expander("Download the current roster"):
     st.download_button(
         "Download roster as Excel",
-        data=sheet_to_excel_bytes(historical_ws),
+        data=build_excel_cached(historical_df),
         file_name="Employee_Hours_Historical_Current.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
